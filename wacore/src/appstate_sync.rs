@@ -36,6 +36,48 @@ fn lookup_app_state_key(
         .ok_or(crate::appstate::AppStateError::KeyNotFound)
 }
 
+/// Download and inline any external snapshot/mutation blobs referenced by `pl`,
+/// resolving each reference via `download`. Best-effort: download/decode failures
+/// are logged and skipped (matches WhatsApp Web).
+fn download_external_blobs<FDownload>(pl: &mut PatchList, download: &FDownload)
+where
+    FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
+{
+    let name = pl.name;
+    if pl.snapshot.is_none()
+        && let Some(ext) = &pl.snapshot_ref
+    {
+        match download(ext) {
+            Ok(data) => match wa::SyncdSnapshot::decode(data.as_slice()) {
+                Ok(snapshot) => pl.snapshot = Some(snapshot),
+                Err(e) => {
+                    log::warn!(target: "AppState", "Failed to decode external snapshot for {name:?}: {e}")
+                }
+            },
+            Err(e) => {
+                log::warn!(target: "AppState", "Failed to download external snapshot for {name:?}: {e}")
+            }
+        }
+    }
+
+    for patch in &mut pl.patches {
+        if let Some(ext) = &patch.external_mutations {
+            let v = patch.version.as_ref().and_then(|x| x.version).unwrap_or(0);
+            match download(ext) {
+                Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
+                    Ok(ext_mutations) => patch.mutations = ext_mutations.mutations,
+                    Err(e) => {
+                        log::warn!(target: "AppState", "Failed to decode external mutations for {name:?} v{v}: {e}")
+                    }
+                },
+                Err(e) => {
+                    log::warn!(target: "AppState", "Failed to download external mutations for {name:?} v{v}: {e}")
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
@@ -104,54 +146,24 @@ impl AppStateProcessor {
     where
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
-        let mut pl = parse_patch_list_ref(stanza_root)?;
+        let pl = parse_patch_list_ref(stanza_root)?;
+        self.process_parsed_patch_list(pl, download, validate_macs)
+            .await
+    }
 
-        // Download external snapshot if present (matches WhatsApp Web behavior)
-        if pl.snapshot.is_none()
-            && let Some(ext) = &pl.snapshot_ref
-            && let Ok(data) = download(ext)
-            && let Ok(snapshot) = wa::SyncdSnapshot::decode(data.as_slice())
-        {
-            pl.snapshot = Some(snapshot);
-        }
-
-        // Download external mutations for each patch (matches WhatsApp Web behavior)
-        for patch in &mut pl.patches {
-            if let Some(ext) = &patch.external_mutations {
-                let patch_version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
-                match download(ext) {
-                    Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
-                        Ok(ext_mutations) => {
-                            log::trace!(
-                                target: "AppState",
-                                "Downloaded external mutations for patch v{}: {} mutations (inline had {})",
-                                patch_version,
-                                ext_mutations.mutations.len(),
-                                patch.mutations.len()
-                            );
-                            patch.mutations = ext_mutations.mutations;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                target: "AppState",
-                                "Failed to decode external mutations for patch v{}: {}",
-                                patch_version,
-                                e
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            target: "AppState",
-                            "Failed to download external mutations for patch v{}: {}",
-                            patch_version,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
+    /// Process an already-parsed single PatchList: download external blobs via
+    /// `download`, then decode + apply. Lets a caller that parsed the response for
+    /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
+    pub async fn process_parsed_patch_list<FDownload>(
+        &self,
+        mut pl: PatchList,
+        download: FDownload,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
+    {
+        download_external_blobs(&mut pl, &download);
         self.process_patch_list(pl, validate_macs).await
     }
 
@@ -164,56 +176,9 @@ impl AppStateProcessor {
     where
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
-        let mut pl = parse_patch_list(stanza_root)?;
-
-        // Download external snapshot if present (matches WhatsApp Web behavior)
-        if pl.snapshot.is_none()
-            && let Some(ext) = &pl.snapshot_ref
-            && let Ok(data) = download(ext)
-            && let Ok(snapshot) = wa::SyncdSnapshot::decode(data.as_slice())
-        {
-            pl.snapshot = Some(snapshot);
-        }
-
-        // Download external mutations for each patch (matches WhatsApp Web behavior)
-        // WhatsApp Web: if (r.externalMutations) { n = yield downloadExternalPatch(e, r) }
-        for patch in &mut pl.patches {
-            if let Some(ext) = &patch.external_mutations {
-                let patch_version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
-                match download(ext) {
-                    Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
-                        Ok(ext_mutations) => {
-                            log::trace!(
-                                target: "AppState",
-                                "Downloaded external mutations for patch v{}: {} mutations (inline had {})",
-                                patch_version,
-                                ext_mutations.mutations.len(),
-                                patch.mutations.len()
-                            );
-                            patch.mutations = ext_mutations.mutations;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                target: "AppState",
-                                "Failed to decode external mutations for patch v{}: {}",
-                                patch_version,
-                                e
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            target: "AppState",
-                            "Failed to download external mutations for patch v{}: {}",
-                            patch_version,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        self.process_patch_list(pl, validate_macs).await
+        let pl = parse_patch_list(stanza_root)?;
+        self.process_parsed_patch_list(pl, download, validate_macs)
+            .await
     }
 
     pub async fn decode_multi_patch_list_ref<FDownload>(
@@ -246,7 +211,10 @@ impl AppStateProcessor {
             .await
     }
 
-    async fn process_patch_lists<FDownload>(
+    /// Process already-parsed patch lists, downloading any external blobs via
+    /// `download`. Lets callers that already parsed the IQ response (e.g. to
+    /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
+    pub async fn process_patch_lists<FDownload>(
         &self,
         patch_lists: Vec<PatchList>,
         download: &FDownload,
@@ -265,43 +233,7 @@ impl AppStateProcessor {
                 continue;
             }
 
-            // Download external snapshot
-            if pl.snapshot.is_none()
-                && let Some(ext) = &pl.snapshot_ref
-            {
-                match download(ext) {
-                    Ok(data) => match wa::SyncdSnapshot::decode(data.as_slice()) {
-                        Ok(snapshot) => pl.snapshot = Some(snapshot),
-                        Err(e) => {
-                            log::warn!(target: "AppState", "Failed to decode external snapshot for {:?}: {e}", pl.name);
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(target: "AppState", "Failed to download external snapshot for {:?}: {e}", pl.name);
-                    }
-                }
-            }
-
-            // Download external mutations for each patch
-            for patch in &mut pl.patches {
-                if let Some(ext) = &patch.external_mutations {
-                    match download(ext) {
-                        Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
-                            Ok(ext_mutations) => {
-                                patch.mutations = ext_mutations.mutations;
-                            }
-                            Err(e) => {
-                                let v = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
-                                log::warn!(target: "AppState", "Failed to decode external mutations for {:?} v{}: {e}", pl.name, v);
-                            }
-                        },
-                        Err(e) => {
-                            let v = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
-                            log::warn!(target: "AppState", "Failed to download external mutations for {:?} v{}: {e}", pl.name, v);
-                        }
-                    }
-                }
-            }
+            download_external_blobs(&mut pl, download);
 
             let (mutations, state, pl) = self.process_patch_list(pl, validate_macs).await?;
             results.push((mutations, state, pl));
