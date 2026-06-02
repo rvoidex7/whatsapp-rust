@@ -25,7 +25,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # --- Builder: cook deps (cached layer), then compile source ---
 FROM chef AS builder
 
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-cpu=native"
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
