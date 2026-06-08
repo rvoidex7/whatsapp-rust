@@ -123,17 +123,27 @@ impl Client {
                             },
                             Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    debug!("Transport disconnected unexpectedly: {reason}");
+                                    // Classify the level: a routine server recycle (clean EOF /
+                                    // normal close) is logged quietly, but a real transport error
+                                    // stays at WARN so it's never hidden behind reconnect noise.
+                                    if reason.is_clean_shutdown() {
+                                        info!("Connection closed by server ({reason}); reconnecting.");
+                                    } else {
+                                        warn!("Transport disconnected: {reason}; reconnecting.");
+                                    }
                                     return Err(anyhow::anyhow!("Transport disconnected: {reason}"));
                                 } else {
                                     debug!("Transport disconnected as expected: {reason}");
                                     return Ok(());
                                 }
                             }
-                            // Event channel closed (no DisconnectReason available).
+                            // Event channel closed (no DisconnectReason available) — the
+                            // transport task ended without reporting why. No reason means we
+                            // can't prove it was a clean recycle, so it stays loud (WARN),
+                            // matching the conservative `Unknown` rule in is_clean_shutdown.
                             Err(_) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    debug!("Transport event channel closed unexpectedly.");
+                                    warn!("Transport event channel closed; reconnecting.");
                                     return Err(anyhow::anyhow!("Transport event channel closed"));
                                 } else {
                                     return Ok(());
@@ -330,7 +340,9 @@ impl Client {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
-                warn!("Received <xmlstreamend/>, treating as disconnect.");
+                // A bare <xmlstreamend/> is the server cleanly ending the stream
+                // (a recycle). We reconnect, so this is routine, not an error.
+                info!("Received <xmlstreamend/> (server stream end); reconnecting.");
             }
             self.notify_connection_shutdown();
             return;
