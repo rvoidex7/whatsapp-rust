@@ -2538,6 +2538,28 @@ impl ProtocolStore for SqliteStore {
         Ok(())
     }
 
+    async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let group_jid = group_jid.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            diesel::delete(
+                group_metadata::table
+                    .filter(group_metadata::group_jid.eq(&group_jid))
+                    .filter(group_metadata::device_id.eq(device_id)),
+            )
+            .execute(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
+    }
+
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -3648,6 +3670,10 @@ mod tests {
             store.get_group_metadata(jid).await.unwrap().as_deref(),
             Some(&b"blob-v2"[..])
         );
+
+        // Delete drops the blob so the next query re-fetches in full.
+        store.delete_group_metadata(jid).await.unwrap();
+        assert!(store.get_group_metadata(jid).await.unwrap().is_none());
     }
 
     #[tokio::test]

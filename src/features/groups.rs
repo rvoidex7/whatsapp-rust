@@ -415,6 +415,17 @@ impl<'a> Groups<'a> {
     pub async fn leave(&self, jid: &Jid) -> Result<(), anyhow::Error> {
         self.client.execute(LeaveGroupIq::new(jid)).await?;
         self.client.get_group_cache().await.invalidate(jid).await;
+        // Drop the persisted blob too: we're no longer in the group, so a stale
+        // phash from it would only force a needless full re-query if ever read.
+        if let Err(e) = self
+            .client
+            .persistence_manager
+            .backend()
+            .delete_group_metadata(&jid.to_string())
+            .await
+        {
+            log::warn!("Failed to delete persisted group metadata for {jid}: {e}");
+        }
         Ok(())
     }
 
@@ -446,7 +457,11 @@ impl<'a> Groups<'a> {
                         .filter(|r| r.is_ok())
                         .map(|r| (&r.jid, r.phone_number.as_ref())),
                 );
+                self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
+            } else {
+                // Cache expired: can't patch in place, so drop the now-stale blob.
+                self.client.invalidate_persisted_group_metadata(jid).await;
             }
         }
         Ok(result)
@@ -471,7 +486,11 @@ impl<'a> Groups<'a> {
             if let Some(info) = group_cache.get(jid).await {
                 let mut info = Arc::unwrap_or_clone(info);
                 info.remove_participants(&accepted);
+                self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
+            } else {
+                // Cache expired: can't patch in place, so drop the now-stale blob.
+                self.client.invalidate_persisted_group_metadata(jid).await;
             }
             self.client
                 .rotate_sender_key_on_participant_remove(&jid.to_string(), &accepted)
@@ -994,6 +1013,38 @@ impl Client {
     pub fn groups(&self) -> Groups<'_> {
         Groups::new(self)
     }
+
+    /// Re-serialize and persist a group's metadata after a local membership change
+    /// so the phash fast-path stays consistent: the in-memory cache expires after
+    /// ~1h, after which a stale persisted blob would force a needless full re-query
+    /// (or be compared against the server as an out-of-date phash). Shared by the
+    /// participant-mutation API and the inbound group-notification handler.
+    pub(crate) async fn persist_group_metadata(&self, jid: &Jid, info: &GroupInfo) {
+        let backend = self.persistence_manager.backend();
+        match serde_json::to_vec(info) {
+            Ok(blob) => {
+                if let Err(e) = backend.put_group_metadata(&jid.to_string(), &blob).await {
+                    log::warn!("Failed to persist group metadata for {jid}: {e}");
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
+        }
+    }
+
+    /// Drop the persisted group metadata on a membership change we can't patch in
+    /// place (the in-memory cache had already expired), so the next query re-fetches
+    /// fresh instead of comparing a now-stale phash. Without this, persisting only on
+    /// a cache hit would miss the exact post-expiry case this fix targets.
+    pub(crate) async fn invalidate_persisted_group_metadata(&self, jid: &Jid) {
+        if let Err(e) = self
+            .persistence_manager
+            .backend()
+            .delete_group_metadata(&jid.to_string())
+            .await
+        {
+            log::warn!("Failed to invalidate persisted group metadata for {jid}: {e}");
+        }
+    }
 }
 
 /// Extract the invite code from any supported invite URL format.
@@ -1169,6 +1220,38 @@ mod tests {
         // not a deep copy of the participant list and LID/PN maps.
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.participants.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_persisted_group_metadata_drops_blob() {
+        // The cache-miss branch of add/remove/leave relies on this to drop a now-stale
+        // persisted blob so the next query re-fetches fresh instead of sending a stale phash.
+        let client = crate::test_utils::create_test_client().await;
+        let backend = client.persistence_manager.backend();
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+
+        backend
+            .put_group_metadata(&group_jid.to_string(), b"stale-blob")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .get_group_metadata(&group_jid.to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        client.invalidate_persisted_group_metadata(&group_jid).await;
+
+        assert!(
+            backend
+                .get_group_metadata(&group_jid.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "invalidation must delete the persisted blob"
+        );
     }
 
     // Protocol-level tests (node building, parsing, validation) are in wacore/src/iq/groups.rs

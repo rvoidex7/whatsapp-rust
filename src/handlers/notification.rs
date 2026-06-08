@@ -1380,6 +1380,9 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
+                    client
+                        .persist_group_metadata(&notification.group_jid, &info)
+                        .await;
                     group_cache
                         .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
@@ -1388,6 +1391,16 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                         "Patched group cache for {}: added {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
+                } else {
+                    // Cache expired: can't patch in place, so drop the now-stale blob.
+                    debug!(
+                        target: "Client/Group",
+                        "Group cache expired for {}: invalidating persisted metadata (add)",
+                        notification.group_jid.observe()
+                    );
+                    client
+                        .invalidate_persisted_group_metadata(&notification.group_jid)
+                        .await;
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
@@ -1396,6 +1409,9 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                 if let Some(info) = group_cache.get(&notification.group_jid).await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
+                    client
+                        .persist_group_metadata(&notification.group_jid, &info)
+                        .await;
                     group_cache
                         .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
@@ -1404,6 +1420,16 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                         "Patched group cache for {}: removed {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
+                } else {
+                    // Cache expired: can't patch in place, so drop the now-stale blob.
+                    debug!(
+                        target: "Client/Group",
+                        "Group cache expired for {}: invalidating persisted metadata (remove)",
+                        notification.group_jid.observe()
+                    );
+                    client
+                        .invalidate_persisted_group_metadata(&notification.group_jid)
+                        .await;
                 }
                 client
                     .rotate_sender_key_on_participant_remove(
