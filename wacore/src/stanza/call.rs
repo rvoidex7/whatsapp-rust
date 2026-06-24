@@ -103,12 +103,13 @@ fn parse_media_offer(
             .filter(|c| c.tag.as_ref() == "to")
         {
             // A <to> destination must carry a parseable jid; skip a malformed one rather than pushing
-            // `to: None`, which is the bare-<enc> (directly-addressed) sentinel.
+            // `to: None`, which is the bare-<enc> (directly-addressed) sentinel. Read the TYPED wire
+            // JID via `to_jid`, never `as_str().parse()`: a LID arrives as an AD-JID whose agent byte
+            // the string form suppresses (`renders_agent(Lid)` is false), so reparsing the string
+            // drops it to agent 0 and the `<to>` would never equal our own (agent-carrying) LID.
             if let Some(enc_node) = to.get_optional_child("enc")
                 && let Some(enc) = parse_offer_enc(enc_node)
-                && let Some(to_jid) = to
-                    .get_attr("jid")
-                    .and_then(|v| v.as_str().parse::<Jid>().ok())
+                && let Some(to_jid) = to.get_attr("jid").and_then(|v| v.to_jid())
             {
                 encs.push(OfferRecipientEnc {
                     to: Some(to_jid),
@@ -815,6 +816,49 @@ mod tests {
         // A device not listed gets nothing, rather than silently decrypting the wrong key.
         let other: Jid = "222222222222222:1@lid".parse().unwrap();
         assert!(media.enc_for(Some(&other)).is_none());
+    }
+
+    // Regression: a LID `<to jid>` decoded from the wire is an AD-JID carrying agent=1 (the Lid domain
+    // byte); our own LID is agent=1 too. The parser must read the TYPED jid (`to_jid`), never
+    // stringify+reparse it (which drops the agent to 0, since `renders_agent(Lid)` is false), or a
+    // multi-device callee never matches its `<to>` and silently fails "offer carried no callKey",
+    // even against the real server. The typed Jid value with agent=1 here is exactly what
+    // `as_node_ref`/the decoder carries for an AD-JID.
+    #[cfg(feature = "voip")]
+    #[test]
+    fn offer_to_jid_keeps_lid_agent_from_typed_jid() {
+        let wire_to = Jid {
+            user: "111111111111111".into(),
+            server: Server::Lid,
+            agent: 1, // the AD-JID domain byte; the string form suppresses it
+            device: 7,
+            integrator: 0,
+        };
+        let to = NodeBuilder::new("to")
+            .attr("jid", &wire_to)
+            .children([NodeBuilder::new("enc")
+                .attr("v", "2")
+                .attr("type", "msg")
+                .bytes(vec![0xB2])
+                .build()])
+            .build();
+        let node = base_call_builder()
+            .children([offer_builder_base()
+                .children([NodeBuilder::new("destination").children([to]).build()])
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        let media = call.media.expect("offer captures media");
+
+        // Our own device LID as get_lid() yields it: agent=1.
+        assert_eq!(
+            media
+                .enc_for(Some(&wire_to))
+                .expect("callKey for our device")
+                .ciphertext,
+            vec![0xB2],
+        );
     }
 
     #[test]
