@@ -47,6 +47,11 @@ jobs:
               - 'src/client/voip.rs'
               - 'wacore/src/stanza/call.rs'
               - 'wacore/src/types/call.rs'
+              # Client hooks carry #[cfg(feature = "voip")] fields, connection teardown, and a session
+              # helper that only the --features voip build compiles.
+              - 'src/client.rs'
+              - 'src/client/lifecycle.rs'
+              - 'src/client/sessions.rs'
               - 'examples/voip.rs'
               - 'examples/observability.rs'
               - 'examples/metrics.rs'
