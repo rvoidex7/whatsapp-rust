@@ -74,24 +74,23 @@ impl CallRegistry {
         // merely ringing. A no-op for an outgoing call (never ringing); for an accepted incoming
         // offer this clears the ringing flag so a later `<terminate>` reads as ended, not missed.
         self.take_ringing(&session.call_id);
-        let mut map = self.inner.lock().expect("registry lock poisoned");
-        let prev = map.insert(
-            session.call_id.clone(),
-            CallEntry {
-                session,
-                media_task: None,
-                generation,
-                rekey_tx: None,
-                on_terminal: None,
-            },
-        );
-        if let Some(CallEntry {
-            media_task: Some(task),
-            ..
-        }) = prev
-        {
-            task.abort();
-        }
+        let prev = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            map.insert(
+                session.call_id.clone(),
+                CallEntry {
+                    session,
+                    media_task: None,
+                    generation,
+                    rekey_tx: None,
+                    on_terminal: None,
+                },
+            )
+        };
+        // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
+        // on_terminal hook fires (the old generation ended). Running those closures off-lock keeps them
+        // from re-entering or poisoning the registry mutex.
+        drop(prev);
         generation
     }
 
@@ -129,6 +128,9 @@ impl CallRegistry {
             .expect("registry lock poisoned")
             .get_mut(call_id)
             && entry.generation == generation
+            // Set-once: a second call for the same generation would otherwise drop (and fire) the
+            // existing hook in place, a false terminal notification. The first hook wins.
+            && entry.on_terminal.is_none()
         {
             entry.on_terminal = Some(EndedNotify(Some(Box::new(notify))));
         }
@@ -249,20 +251,14 @@ impl CallRegistry {
 
     /// Remove a call, aborting its media task. Returns true if it existed.
     pub fn remove(&self, call_id: &str) -> bool {
-        match self
+        let removed = self
             .inner
             .lock()
             .expect("registry lock poisoned")
-            .remove(call_id)
-        {
-            Some(entry) => {
-                if let Some(task) = entry.media_task {
-                    task.abort();
-                }
-                true
-            }
-            None => false,
-        }
+            .remove(call_id);
+        // `removed` drops here, after the lock guard: the media-task abort and on_terminal hook run
+        // off-lock.
+        removed.is_some()
     }
 
     /// Remove a call only if it is still on `generation` -- the safe self-cleanup for a finishing
@@ -270,33 +266,29 @@ impl CallRegistry {
     /// task that ended after being superseded can't reap the live replacement. Returns true if this
     /// generation was the current entry and was removed.
     pub fn remove_if_current(&self, call_id: &str, generation: u64) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
-        if map.get(call_id).is_some_and(|e| e.generation == generation) {
-            if let Some(CallEntry {
-                media_task: Some(task),
-                ..
-            }) = map.remove(call_id)
-            {
-                task.abort();
+        let removed = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            if map.get(call_id).is_some_and(|e| e.generation == generation) {
+                map.remove(call_id)
+            } else {
+                None
             }
-            true
-        } else {
-            false
-        }
+        };
+        // `removed` drops here, off-lock: the media-task abort and on_terminal hook run without the
+        // registry mutex held.
+        removed.is_some()
     }
 
     /// Abort every call's media task and clear the registry. Returns the number cleared.
     /// Call this from your own disconnect/reconnect teardown; it is not wired into the client.
     pub fn abort_all(&self) -> usize {
         self.ringing.lock().expect("registry lock poisoned").clear();
-        let mut map = self.inner.lock().expect("registry lock poisoned");
-        for entry in map.values() {
-            if let Some(task) = &entry.media_task {
-                task.abort();
-            }
-        }
-        let n = map.len();
-        map.clear();
+        let drained: Vec<CallEntry> = {
+            let mut map = self.inner.lock().expect("registry lock poisoned");
+            map.drain().map(|(_, entry)| entry).collect()
+        };
+        let n = drained.len();
+        // `drained` drops here, off-lock: every entry aborts its media task and fires on_terminal.
         n
     }
 }
