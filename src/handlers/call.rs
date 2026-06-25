@@ -864,4 +864,55 @@ mod tests {
             "a locally-declined call must not be recorded as a missed call"
         );
     }
+
+    // A call we answered must not later be recorded as missed: accepting registers the call (as
+    // accept().start() -> spawn_call -> registry.insert does), which consumes the ringing flag, so a
+    // caller <terminate> after we picked up reads as ended, not missed.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn answered_call_then_caller_terminate_is_not_missed() {
+        let client = make_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
+        // The offer rings.
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&offer_stanza()),
+                    &mut cancelled
+                )
+                .await
+        );
+
+        // We answer it: registering the call (what spawn_call does) consumes the ringing flag.
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let creator = fake_caller_lid();
+        client
+            .call_registry()
+            .insert(wacore::voip::CallSession::new_incoming(
+                "CALL-ID-0001",
+                peer,
+                creator.clone(),
+            ));
+
+        // The caller later hangs up; the answered call must not surface a missed call.
+        let terminate = terminate_stanza(creator.clone(), creator, "CALL-ID-0001");
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&terminate),
+                    &mut cancelled
+                )
+                .await
+        );
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-0001"),
+            0,
+            "an answered call must not be recorded as a missed call"
+        );
+    }
 }

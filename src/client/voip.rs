@@ -85,12 +85,12 @@ impl Voip<'_> {
         }
         let id = self.client.generate_request_id();
         let stanza = build_reject(call_id, &incoming.from, incoming.action.call_creator(), &id);
-        self.client.send_node(stanza).await?;
-        // A locally-declined call is resolved: consume its ringing flag so a caller <terminate> that
-        // follows our <reject> reads as ended, not a phantom missed call (WA Web deletes the call from
-        // _ringingCalls on reject). No-op if it was never ringing.
+        // Consume the ringing flag BEFORE the async send: a caller <terminate> processed while we await
+        // the send would otherwise hit take_ringing first and surface a phantom missed call for a call
+        // we already declined (WA Web deletes it from _ringingCalls on reject). No-op if never ringing.
         #[cfg(feature = "voip")]
         self.client.call_registry().take_ringing(call_id);
+        self.client.send_node(stanza).await?;
         Ok(())
     }
 
