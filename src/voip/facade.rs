@@ -76,6 +76,13 @@ impl<'a> AcceptCall<'a> {
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
+        // Answering consumes the ringing flag now, BEFORE the media-setup awaits (callKey decrypt /
+        // relay connect): a peer <terminate> racing this window must not record a missed call for a
+        // call we are answering. A failed start() leaves it cleared -- an attempted answer reads as
+        // ended, not an ignored missed ring.
+        self.client
+            .call_registry()
+            .take_ringing(self.incoming.action.call_id());
         let (engine, call_id, addr) = self.build_engine().await?;
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
@@ -872,7 +879,7 @@ async fn spawn_call(
         move || ended.notify()
     });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
-    if let Err(e) = attach_engine(
+    attach_engine(
         client,
         &call_id,
         generation,
@@ -886,13 +893,7 @@ async fn spawn_call(
         // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
         None,
     )
-    .await
-    {
-        // `insert` cleared the ringing flag, but a failed accept never answered the call. Restore the
-        // flag so a later peer <terminate> (the caller giving up) still surfaces a missed call.
-        client.call_registry().mark_incoming_ringing(&call_id);
-        return Err(e);
-    }
+    .await?;
     Ok(CallHandle {
         call_id,
         generation,

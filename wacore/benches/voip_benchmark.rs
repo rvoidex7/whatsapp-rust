@@ -98,17 +98,22 @@ fn peer_pipeline() -> MediaPipeline {
 }
 
 fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirection) -> CallConfig {
-    CallConfig::for_test(
+    CallConfig {
+        call_id: "BENCH".into(),
         direction,
-        self_lid,
-        peer_lid,
-        call_key(),
+        self_lid: self_lid.into(),
+        peer_lid: peer_lid.into(),
+        call_key: call_key(),
         ssrc,
-        "203.0.113.7",
-        3478,
-        true,  // enable_media
-        false, // enable_sframe
-    )
+        samples_per_packet: SAMPLES as u32,
+        relay_token: vec![0xAB; 16],
+        relay_ip: "203.0.113.7".into(),
+        relay_port: 3478,
+        integrity_key: b"relay-key".to_vec(),
+        warp_mi_tag_len: 4,
+        enable_media: true,
+        enable_sframe: false,
+    }
 }
 
 fn config() -> CallConfig {

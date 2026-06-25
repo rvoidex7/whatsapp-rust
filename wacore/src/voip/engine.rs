@@ -89,9 +89,8 @@ impl TxIdSource for SequentialTxIds {
 /// Everything the engine needs to be self-contained for one call. The relay fields come from the
 /// parsed `<relay>` stanza; the crypto fields from the decrypted callKey and our/our-peer LIDs.
 /// Build it via [`for_incoming`](Self::for_incoming) / [`for_outgoing`](Self::for_outgoing), which
-/// validate the relay block; `#[non_exhaustive]` so adding a field stays non-breaking for consumers.
+/// validate the relay block.
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct CallConfig {
     pub call_id: String,
     pub direction: CallDirection,
@@ -276,41 +275,6 @@ impl CallConfig {
             call_key,
             relay,
         )
-    }
-
-    /// Build a config with explicit fields for tests, bypassing the relay-block derivation. Hidden
-    /// from docs: `#[non_exhaustive]` blocks cross-crate struct-literal construction, so a
-    /// dependent-crate test (e.g. the loopback relay e2e) builds through this. The relay token /
-    /// integrity key / call-id are fixed test values.
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_test(
-        direction: CallDirection,
-        self_lid: impl Into<String>,
-        peer_lid: impl Into<String>,
-        call_key: Vec<u8>,
-        ssrc: u32,
-        relay_ip: impl Into<String>,
-        relay_port: u16,
-        enable_media: bool,
-        enable_sframe: bool,
-    ) -> Self {
-        Self {
-            call_id: "CID".into(),
-            direction,
-            self_lid: self_lid.into(),
-            peer_lid: peer_lid.into(),
-            call_key,
-            ssrc,
-            samples_per_packet: 960,
-            relay_token: vec![0xAB; 16],
-            relay_ip: relay_ip.into(),
-            relay_port,
-            integrity_key: b"relay-key".to_vec(),
-            warp_mi_tag_len: super::warp::WARP_MI_TAG_LEN,
-            enable_media,
-            enable_sframe,
-        }
     }
 }
 

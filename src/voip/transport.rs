@@ -559,17 +559,22 @@ mod udp_relay_e2e {
     const SAMPLES: u32 = 960;
 
     fn config(relay_addr: SocketAddr) -> CallConfig {
-        CallConfig::for_test(
-            CallDirection::Incoming,
-            SELF_LID,
-            PEER_LID,
-            (0u8..32).collect(),
-            SSRC,
-            relay_addr.ip().to_string(),
-            relay_addr.port(),
-            true,  // enable_media
-            false, // enable_sframe (the loopback peer ships plain Opus inside E2E-SRTP)
-        )
+        CallConfig {
+            call_id: "CID".into(),
+            direction: CallDirection::Incoming,
+            self_lid: SELF_LID.into(),
+            peer_lid: PEER_LID.into(),
+            call_key: (0u8..32).collect(),
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            relay_token: vec![0xAB; 16],
+            relay_ip: relay_addr.ip().to_string(),
+            relay_port: relay_addr.port(),
+            integrity_key: b"relay-key".to_vec(),
+            warp_mi_tag_len: 4,
+            enable_media: true,
+            enable_sframe: false,
+        }
     }
 
     /// The relay server half of the DataChannel: the DTLS server handshake (mirroring the client's
