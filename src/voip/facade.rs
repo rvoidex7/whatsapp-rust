@@ -550,6 +550,12 @@ async fn place_call(
 
     let muted = Arc::new(AtomicBool::new(false));
     let ended = Arc::new(EndedFlag::default());
+    // Wake wait_ended() whenever this registry entry is removed -- including a terminal stanza or a
+    // disconnect that lands while we're still dialing the relay (no media task yet to carry the notify).
+    registry.set_ended_notify(&call_id, generation, {
+        let ended = ended.clone();
+        move || ended.notify()
+    });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
 
     // Recv-rekey channel, created now (not at engine build) so a `<accept>` that races ahead of the
@@ -864,6 +870,12 @@ async fn spawn_call(
 
     let muted = Arc::new(AtomicBool::new(false));
     let ended = Arc::new(EndedFlag::default());
+    // Wake wait_ended() whenever this registry entry is removed -- including a terminal stanza or a
+    // disconnect that lands while attach_engine is still dialing (no media task yet).
+    registry.set_ended_notify(&call_id, generation, {
+        let ended = ended.clone();
+        move || ended.notify()
+    });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
     attach_engine(
         client,
@@ -928,45 +940,31 @@ async fn attach_engine(
     // generation and wake any wait_ended() waiter before propagating, else an incoming call leaks in
     // the registry and an outgoing handle's wait_ended() hangs with no dormant entry left to drain.
     //
-    // Race the dial against the call ending. A hangup landing in this window -- the media task isn't
-    // registered yet and (for an outgoing call) the PendingOutgoing was already consumed -- notifies
-    // `ended`; selecting on it drops the in-flight connect future to abort the unwanted DTLS/SCTP dial
-    // instead of letting it run to success or the 12s timeout while wait_ended() stays parked.
+    // Race the dial against the call ending. A hangup, a peer <terminate>, or a disconnect landing in
+    // this window all remove our registry entry, and its `on_terminal` hook notifies `ended` even
+    // though no media task exists yet -- so selecting on `ended` drops the in-flight connect future to
+    // abort the unwanted DTLS/SCTP dial instead of letting it run to success or the 12s timeout while
+    // wait_ended() stays parked.
     let dial = factory.connect();
-    // Stop the dial as soon as the call ends OR the connection drops. A disconnect runs
-    // `abort_all()`, which clears our still-task-less registry entry WITHOUT touching `ended` (the
-    // notify lives on the media task's drop-guard, not built yet here), and for an outgoing call the
-    // PendingOutgoing was already drained -- so without the shutdown arm a disconnect mid-dial would
-    // leave wait_ended() parked until connect() hit its own ~12s timeout.
-    let shutdown = client.connection_shutdown_signal();
-    let stop = async {
-        futures::future::select(
-            std::pin::pin!(ended.wait()),
-            std::pin::pin!(wacore::runtime::wait_for_shutdown(&shutdown)),
-        )
-        .await;
-    };
-    let (transport, relay_events) = match futures::future::select(dial, std::pin::pin!(stop)).await
-    {
-        futures::future::Either::Left((Ok(pair), _)) => pair,
-        futures::future::Either::Left((Err(e), _)) => {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-            ended.notify();
-            return Err(CallError::Connect(e.to_string()));
-        }
-        // Ended or disconnected mid-dial: the loser `dial` future drops here, aborting the connect.
-        // Reap our generation and notify `ended` (idempotent) -- for the disconnect case `ended` was
-        // not set by abort_all, so this is what resolves a parked wait_ended().
-        futures::future::Either::Right(((), _dial)) => {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-            ended.notify();
-            return Err(CallError::Connect("call ended during relay connect".into()));
-        }
-    };
+    let (transport, relay_events) =
+        match futures::future::select(dial, std::pin::pin!(ended.wait())).await {
+            futures::future::Either::Left((Ok(pair), _)) => pair,
+            futures::future::Either::Left((Err(e), _)) => {
+                client
+                    .call_registry()
+                    .remove_if_current(call_id, generation);
+                ended.notify();
+                return Err(CallError::Connect(e.to_string()));
+            }
+            // Ended mid-dial: the loser `dial` future drops here, aborting the connect. The generation
+            // was already reaped by whoever ended us; reap defensively and stop.
+            futures::future::Either::Right(((), _dial)) => {
+                client
+                    .call_registry()
+                    .remove_if_current(call_id, generation);
+                return Err(CallError::Connect("call ended during relay connect".into()));
+            }
+        };
 
     // The shared mute flag the mic feed checks: muted frames become exact-zero (the engine sends a
     // cheap DTX comfort-noise frame for an all-zero frame, so the relay stream never gaps).
@@ -2275,6 +2273,13 @@ mod tests {
         let generation = client.call_registry().insert(mk_session());
         let muted = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(EndedFlag::default());
+        // place_call/spawn_call wire this hook; replicate it so removing the entry wakes `ended`.
+        client
+            .call_registry()
+            .set_ended_notify("CID-FACADE", generation, {
+                let ended = ended.clone();
+                move || ended.notify()
+            });
         let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
 
         let attach = tokio::spawn({
@@ -2298,13 +2303,11 @@ mod tests {
                 .await
             }
         });
-        // Let attach_engine subscribe to the shutdown signal and park in the gated connect.
+        // Let attach_engine park in the gated connect.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // Simulate the connection dropping: abort_all clears the task-less entry, then the shutdown
-        // signal fires (the order cleanup_connection_state uses).
+        // A disconnect clears the task-less registry entry, whose on_terminal hook wakes `ended`.
         client.call_registry().abort_all();
-        client.notify_connection_shutdown();
 
         tokio::time::timeout(std::time::Duration::from_secs(2), ended.wait())
             .await
@@ -2320,6 +2323,71 @@ mod tests {
             matches!(res, Err(CallError::Connect(_))),
             "an aborted dial surfaces a Connect error"
         );
+    }
+
+    // A peer <terminate>/<reject> during the connect window removes the task-less registry entry via
+    // terminate_call; its on_terminal hook must wake `ended` (no pending entry to drain, no media task
+    // to abort), aborting the dial instead of parking wait_ended() until the connect timeout.
+    #[tokio::test]
+    async fn peer_terminate_during_connect_window_resolves_wait_ended_and_aborts_dial() {
+        let client = make_client().await;
+        let (_gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+        let (_relay_tx, relay_rx) = async_channel::unbounded();
+        let factory = Arc::new(GatedFactory {
+            gate: gate_rx,
+            relay_rx: Mutex::new(Some(relay_rx)),
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let generation = client.call_registry().insert(mk_session());
+        let muted = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(EndedFlag::default());
+        client
+            .call_registry()
+            .set_ended_notify("CID-FACADE", generation, {
+                let ended = ended.clone();
+                move || ended.notify()
+            });
+        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
+
+        let attach = tokio::spawn({
+            let client = client.clone();
+            let factory = factory.clone();
+            let ended = ended.clone();
+            async move {
+                attach_engine(
+                    &client,
+                    "CID-FACADE",
+                    generation,
+                    engine(),
+                    &*factory,
+                    Arc::new(mic_rx),
+                    Arc::new(spk_tx),
+                    muted,
+                    ended,
+                    ev_tx,
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // The peer terminal-stanza path (no pending entry; entry has no media task yet).
+        terminate_call(&client, "CID-FACADE");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), ended.wait())
+            .await
+            .expect("a peer terminate in the connect window must wake `ended`");
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), attach)
+            .await
+            .expect("attach_engine must return once the terminate aborts the dial")
+            .expect("attach task");
+        assert!(matches!(res, Err(CallError::Connect(_))));
+        assert_eq!(client.call_registry().active_count(), 0);
     }
 
     // A pending-outgoing call with no matching call-id leaves attach_outgoing_relay a no-op (returns

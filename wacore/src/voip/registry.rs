@@ -17,6 +17,21 @@ use crate::runtime::AbortHandle;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
+/// Runs its closure when dropped. Stored on a [`CallEntry`] to wake the call's `wait_ended()` waiter
+/// whenever the entry is removed (terminal stanza, disconnect, supersession) -- including in the
+/// window after registration but before a media task exists to carry the notify on its own teardown.
+/// Every entry-drop is a terminal event for that generation, and the wake (a sticky flag) is
+/// idempotent with the media task's own drop-guard, so firing it on every removal is safe.
+struct EndedNotify(Option<Box<dyn FnOnce() + Send>>);
+
+impl Drop for EndedNotify {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 struct CallEntry {
     session: CallSession,
     media_task: Option<AbortHandle>,
@@ -26,6 +41,9 @@ struct CallEntry {
     /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
     /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
     rekey_tx: Option<async_channel::Sender<String>>,
+    /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
+    /// `EndedNotify`'s Drop whenever the entry leaves the map.
+    on_terminal: Option<EndedNotify>,
 }
 
 /// Thread-safe map of active calls keyed by call-id.
@@ -64,6 +82,7 @@ impl CallRegistry {
                 media_task: None,
                 generation,
                 rekey_tx: None,
+                on_terminal: None,
             },
         );
         if let Some(CallEntry {
@@ -92,6 +111,26 @@ impl CallRegistry {
                 }
             }
             _ => handle.abort(),
+        }
+    }
+
+    /// Attach the wake-on-removal hook for the call under `generation`: when the entry is removed
+    /// (terminal stanza / disconnect / supersession), `notify` runs to wake a parked `wait_ended()`,
+    /// even if no media task was attached yet. Generation-guarded and ignored if removed/superseded.
+    pub fn set_ended_notify(
+        &self,
+        call_id: &str,
+        generation: u64,
+        notify: impl FnOnce() + Send + 'static,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            && entry.generation == generation
+        {
+            entry.on_terminal = Some(EndedNotify(Some(Box::new(notify))));
         }
     }
 
@@ -275,6 +314,50 @@ mod tests {
             Jid::new("222222222222222", Server::Lid),
             Jid::new("111111111111111", Server::Lid),
         )
+    }
+
+    #[test]
+    fn ended_notify_fires_on_removal_even_without_a_media_task() {
+        let reg = CallRegistry::new();
+        let fired = Arc::new(AtomicBool::new(false));
+        let g = reg.insert(session("CID"));
+        reg.set_ended_notify("CID", g, {
+            let fired = fired.clone();
+            move || fired.store(true, Ordering::SeqCst)
+        });
+        // No media task attached (the connect-window case).
+        assert!(reg.remove_if_current("CID", g));
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "removing a task-less entry must wake its wait_ended() via the on_terminal hook"
+        );
+    }
+
+    #[test]
+    fn ended_notify_is_generation_guarded_and_fires_via_abort_all() {
+        let reg = CallRegistry::new();
+        // A stale generation must not attach the hook.
+        let stale = Arc::new(AtomicBool::new(false));
+        let g = reg.insert(session("CID"));
+        reg.set_ended_notify("CID", g + 99, {
+            let stale = stale.clone();
+            move || stale.store(true, Ordering::SeqCst)
+        });
+        // The live generation attaches it; abort_all (disconnect) fires it.
+        let fired = Arc::new(AtomicBool::new(false));
+        reg.set_ended_notify("CID", g, {
+            let fired = fired.clone();
+            move || fired.store(true, Ordering::SeqCst)
+        });
+        reg.abort_all();
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "abort_all must fire on_terminal"
+        );
+        assert!(
+            !stale.load(Ordering::SeqCst),
+            "a stale-generation hook must never have been attached"
+        );
     }
 
     /// An abort handle that flips a shared flag, so a test can assert the registry actually aborts
