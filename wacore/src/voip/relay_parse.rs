@@ -32,7 +32,7 @@ pub struct RelayEndpoint {
     pub c2r_rtt_ms: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct RelayData {
     pub hbh_key: Option<Vec<u8>>,
     /// Raw `<hbh_key>` content (ASCII base64); used as the STUN MESSAGE-INTEGRITY key.
@@ -47,6 +47,34 @@ pub struct RelayData {
     pub relay_tokens: Vec<Vec<u8>>,
     pub auth_tokens: Vec<Vec<u8>>,
     pub endpoints: Vec<RelayEndpoint>,
+}
+
+// Manual Debug so a stray `{:?}` (e.g. on Event::IncomingCall, which carries this) can't leak the
+// SRTP master key, the STUN MESSAGE-INTEGRITY key, or the relay/auth tokens. Matches the redaction
+// the sibling key structs already apply (E2eSrtpKeys, SrtpKeyingMaterial, CallConfig).
+impl core::fmt::Debug for RelayData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let redact = |o: &Option<Vec<u8>>| o.as_ref().map(|_| "[redacted]");
+        f.debug_struct("RelayData")
+            .field("hbh_key", &redact(&self.hbh_key))
+            .field("hbh_key_ascii", &redact(&self.hbh_key_ascii))
+            .field("relay_key", &redact(&self.relay_key))
+            .field("relay_key_ascii", &redact(&self.relay_key_ascii))
+            .field("warp_mi_tag_len", &self.warp_mi_tag_len)
+            .field("uuid", &self.uuid)
+            .field("self_pid", &self.self_pid)
+            .field("peer_pid", &self.peer_pid)
+            .field(
+                "relay_tokens",
+                &format_args!("[{} redacted]", self.relay_tokens.len()),
+            )
+            .field(
+                "auth_tokens",
+                &format_args!("[{} redacted]", self.auth_tokens.len()),
+            )
+            .field("endpoints", &self.endpoints)
+            .finish()
+    }
 }
 
 fn looks_like_base64(txt: &str) -> bool {

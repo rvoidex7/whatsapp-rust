@@ -266,8 +266,15 @@ impl RelayTransport for RelayMediaChannel {
 /// Inbound event-channel depth. VoIP is loss tolerant, so the read pump drops packets rather than
 /// block when the driver falls behind.
 const RELAY_EVENT_CAP: usize = 256;
-/// One DataChannel message fits in a UDP MTU; 1500 covers any STUN/RTP/RTCP packet WA sends.
+/// One DataChannel message fits in a UDP MTU; 1500 covers any STUN/RTP/RTCP packet WA sends. Used by
+/// the in-test loopback relay, whose messages are single small packets.
+#[cfg(test)]
 const RELAY_READ_BUF: usize = 1500;
+/// SCTP read buffer for the inbound pump. webrtc-sctp reassembles inbound messages up to its default
+/// `max_message_size` (65536) regardless of MTU, and a buffer smaller than the delivered message
+/// yields a fatal `ErrShortBuffer` that drops the call. Size to the reassembly cap so no relay-sent
+/// message can truncate. Heap, allocated once per call and reused (not a stack array).
+const RELAY_SCTP_READ_BUF: usize = 65536;
 /// Upper bound on the relay handshake (UDP+DTLS+SCTP+DataChannel); a black-holed or wedged endpoint
 /// fails here instead of parking the caller forever.
 const RELAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
@@ -347,7 +354,7 @@ async fn relay_read_pump<R: RelayChannelRead>(
     dc: Arc<R>,
     tx: async_channel::Sender<RelayTransportEvent>,
 ) {
-    let mut buf = vec![0u8; RELAY_READ_BUF];
+    let mut buf = vec![0u8; RELAY_SCTP_READ_BUF];
     loop {
         match dc.read_message(&mut buf).await {
             // After the call ends the SCTP stream resets and read returns Ok(0) forever (EOF).
