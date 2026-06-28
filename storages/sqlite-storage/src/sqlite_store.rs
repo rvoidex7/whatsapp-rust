@@ -353,12 +353,7 @@ impl SqliteStore {
         let server_cert_chain: Option<Arc<[u8]>> = device_data
             .server_cert_chain
             .as_ref()
-            .map(|chain| {
-                bincode::serde::encode_to_vec(chain, bincode::config::standard())
-                    .map(Arc::from)
-                    .map_err(|e| StoreError::Serialization(Box::new(e)))
-            })
-            .transpose()?;
+            .map(|chain| Arc::from(crate::wire::encode_server_cert_chain(chain)));
         let login_counter = device_data.login_counter;
         let new_lid: Arc<str> = Arc::from(
             device_data
@@ -629,11 +624,8 @@ impl SqliteStore {
                         // change between versions) must NOT block startup —
                         // log it and degrade to None so the next connect
                         // simply pays one XX handshake to repopulate.
-                        match bincode::serde::decode_from_slice(
-                            bytes,
-                            bincode::config::standard(),
-                        ) {
-                            Ok((chain, _)) => Some(chain),
+                        match crate::wire::decode_server_cert_chain(bytes) {
+                            Ok(chain) => Some(chain),
                             Err(e) => {
                                 log::warn!(
                                     "device {} server_cert_chain blob ({} bytes) failed to decode: {e}; \
@@ -992,9 +984,20 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (key, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(Some(key))
+            // An undecodable blob (an old bincode row or genuine corruption) is
+            // treated as absent: the app-state sync path then re-requests the key,
+            // the primary re-shares it, and the next set overwrites it as protobuf.
+            match crate::wire::decode_app_state_sync_key(&data) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => {
+                    warn!(
+                        "app_state_sync_key blob ({} bytes) failed to decode: {e}; \
+                         treating as absent, key will be re-requested",
+                        data.len()
+                    );
+                    Ok(None)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -1008,8 +1011,7 @@ impl SqliteStore {
     ) -> Result<()> {
         let pool = self.pool.clone();
         let key_id = key_id.to_vec();
-        let data = bincode::serde::encode_to_vec(&key, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_app_state_sync_key(&key);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
@@ -1042,13 +1044,22 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                let res: Option<Vec<u8>> = app_state_keys::table
-                    .select(app_state_keys::key_id)
+                // Return the latest key whose blob actually decodes. A legacy bincode
+                // row (or a corrupt one) reads as absent via get_sync_key but still
+                // sits in the table with a possibly lexicographically-higher key_id;
+                // selecting it here would make the outbound build_patch fail later in
+                // get_app_state_key with KeyNotFound. Skip undecodable rows so outbound
+                // mutations use the newest USABLE key.
+                let candidates: Vec<(Vec<u8>, Vec<u8>)> = app_state_keys::table
+                    .select((app_state_keys::key_id, app_state_keys::key_data))
                     .filter(app_state_keys::device_id.eq(device_id))
                     .order(app_state_keys::key_id.desc())
-                    .first(&mut conn)
-                    .optional()
+                    .load(&mut conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
+                let res = candidates
+                    .into_iter()
+                    .find(|(_, data)| crate::wire::decode_app_state_sync_key(data).is_ok())
+                    .map(|(key_id, _)| key_id);
                 Ok(res)
             })
             .await
@@ -1081,9 +1092,19 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (state, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(state)
+            // An undecodable blob (an old bincode row or corruption) resets the
+            // collection to default, which simply re-syncs it from version 0.
+            match crate::wire::decode_hash_state(&data) {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    warn!(
+                        "app_state_version blob ({} bytes) failed to decode: {e}; \
+                         resetting to default, collection will re-sync from 0",
+                        data.len()
+                    );
+                    Ok(HashState::default())
+                }
+            }
         } else {
             Ok(HashState::default())
         }
@@ -1096,8 +1117,7 @@ impl SqliteStore {
         device_id: i32,
     ) -> Result<()> {
         let name = name.to_string();
-        let data = bincode::serde::encode_to_vec(&state, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_hash_state(&state);
         self.with_retry("set_app_state_version", || {
             let name = name.clone();
             let data = data.clone();
@@ -3853,7 +3873,7 @@ mod tests {
     /// Round-trips a `CachedServerCertChain` through the SQLite schema:
     /// save → close store → reopen on the same db_name → load. Exercises
     /// the `2026-04-26-000000_add_server_cert_chain` migration plus the
-    /// bincode encode/decode path in `save_device_data_for_device` /
+    /// protobuf encode/decode path in `save_device_data_for_device` /
     /// `load_device_data_for_device` (the part that the in-memory backend
     /// integration tests don't reach).
     #[tokio::test]
@@ -3910,7 +3930,7 @@ mod tests {
 
         // Second store on the SAME shared-cache db: this exercises the
         // exact path a fresh-process load would take — schema migration
-        // already applied, BLOB column present, and the bincode-encoded
+        // already applied, BLOB column present, and the protobuf-encoded
         // chain decoded by the load path.
         let store = SqliteStore::new_for_device(&db_name, device_id)
             .await
@@ -3943,6 +3963,238 @@ mod tests {
         assert!(
             reloaded.server_cert_chain.is_none(),
             "cleared chain must round-trip as None"
+        );
+    }
+
+    // The migration strategy is self-healing with NO migration: rows written by the
+    // old `bincode` codec can't decode as the new protobuf wire format, so the store
+    // must read them back as ABSENT (never an error) -- then the sync path re-requests
+    // the key / re-syncs the collection, and the protobuf setters overwrite the row.
+    #[tokio::test]
+    async fn legacy_bincode_blobs_self_heal_then_overwrite() {
+        use diesel::{ExpressionMethods, RunQueryDsl, sql_query};
+        use wacore::appstate::hash::HashState;
+        use wacore::store::traits::AppStateSyncKey;
+
+        // Exact bytes `bincode` 2.0.1 (config::standard, via serde) produced for these
+        // domain structs before the migration, captured with the real codec. They must
+        // not parse as the protobuf wire format.
+        // AppStateSyncKey { key_data: [0x11;32], fingerprint: [aa bb cc dd], timestamp: 1_700_000_000 }.
+        let legacy_sync_key = {
+            let mut v = vec![0x20u8]; // bincode varint len 32
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+        // HashState { version: 7, hash: [de ad 00..00 be], index_value_map: {} }.
+        let legacy_hash_state = {
+            let mut v = vec![0x07u8]; // version varint 7
+            v.push(0xde);
+            v.push(0xad);
+            v.extend([0u8; 125]);
+            v.push(0xbe);
+            v.push(0x00); // empty map
+            v
+        };
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // Insert the legacy rows directly (bypassing the protobuf setters), exactly as
+        // an upgraded DB would already hold them.
+        let key_id = b"legacy-key".to_vec();
+        {
+            let kid = key_id.clone();
+            let blob = legacy_sync_key.clone();
+            store
+                .with_retry("insert_legacy_key", move || {
+                    let kid = kid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(kid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy key row");
+        }
+        let name = "critical_block";
+        {
+            let blob = legacy_hash_state.clone();
+            store
+                .with_retry("insert_legacy_version", move || {
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_versions::table)
+                            .values((
+                                app_state_versions::name.eq(name),
+                                app_state_versions::state_data.eq(blob),
+                                app_state_versions::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy version row");
+        }
+
+        // Self-heal: a legacy bincode row reads back as absent / default, NOT an error,
+        // and never as a partially-decoded protobuf with garbage material.
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("legacy sync-key blob must not surface a decode error")
+                .is_none(),
+            "a legacy bincode sync-key row must read back as absent"
+        );
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(name, device_id)
+                .await
+                .expect("legacy version blob must not surface a decode error")
+                .version,
+            0,
+            "a legacy bincode version row must reset to default (re-sync from 0)"
+        );
+
+        // And the protobuf setters overwrite the healed rows: a re-shared key and a
+        // fresh version persist and read back correctly afterwards.
+        store
+            .set_app_state_sync_key_for_device(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1, 2, 3],
+                    timestamp: 99,
+                },
+                device_id,
+            )
+            .await
+            .expect("overwrite key");
+        let healed_key = store
+            .get_app_state_sync_key_for_device(&key_id, device_id)
+            .await
+            .expect("get key")
+            .expect("re-shared key must persist over the legacy row");
+        assert_eq!(healed_key.key_data, vec![7u8; 32]);
+        assert_eq!(healed_key.timestamp, 99);
+
+        store
+            .set_app_state_version_for_device(
+                name,
+                HashState {
+                    version: 5,
+                    ..HashState::default()
+                },
+                device_id,
+            )
+            .await
+            .expect("overwrite version");
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(name, device_id)
+                .await
+                .expect("get version")
+                .version,
+            5,
+            "a re-synced version must persist over the legacy row"
+        );
+
+        // Genuine corruption (not a clean bincode blob) is handled the same way.
+        store
+            .with_retry("corrupt_key", || {
+                Box::new(|conn| {
+                    sql_query("UPDATE app_state_keys SET key_data = X'00ff00ff'")
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .expect("corrupt key blob");
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("corrupt key blob must not error")
+                .is_none(),
+            "an arbitrarily corrupt sync-key blob must also read back as absent"
+        );
+    }
+
+    // Outbound mutations (chat actions) encrypt with the latest sync key, so the
+    // latest-key selection must skip a legacy bincode row even when it sorts higher --
+    // otherwise build_patch would later fail in get_app_state_key with KeyNotFound.
+    #[tokio::test]
+    async fn latest_sync_key_skips_undecodable_rows() {
+        use diesel::{ExpressionMethods, RunQueryDsl};
+        use wacore::store::traits::AppStateSyncKey;
+
+        // Real bincode 2.0.1 bytes for an AppStateSyncKey -- undecodable as protobuf.
+        let legacy_blob = {
+            let mut v = vec![0x20u8];
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // A valid (protobuf) key at a LOWER key_id...
+        let good_id = b"key-aaa".to_vec();
+        store
+            .set_app_state_sync_key_for_device(
+                &good_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1],
+                    timestamp: 1,
+                },
+                device_id,
+            )
+            .await
+            .unwrap();
+
+        // ...and a stale bincode row at a lexicographically HIGHER key_id, inserted raw.
+        let bad_id = b"key-zzz".to_vec();
+        {
+            let bid = bad_id.clone();
+            let blob = legacy_blob.clone();
+            store
+                .with_retry("insert_stale_key", move || {
+                    let bid = bid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(bid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+
+        // The higher-but-undecodable row must be skipped for the usable key.
+        assert_eq!(
+            store
+                .get_latest_app_state_sync_key_id_for_device(device_id)
+                .await
+                .unwrap(),
+            Some(good_id),
+            "latest-key selection must skip undecodable bincode rows"
         );
     }
 

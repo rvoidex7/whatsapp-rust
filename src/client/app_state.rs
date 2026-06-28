@@ -224,7 +224,10 @@ impl Client {
 
             // Parse the response once here for pre-download; the same parsed
             // lists are handed to the processor below (no second parse).
-            let patch_lists = wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
+            let mut patch_lists =
+                wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
+
+            let proc = self.get_app_state_processor().await;
             {
                 for pl in &patch_lists {
                     // Download external snapshot
@@ -282,8 +285,31 @@ impl Client {
                 }
             };
 
-            // Process the already-parsed collections (no re-parse of the response).
-            let proc = self.get_app_state_processor().await;
+            // Request any missing decode keys and wait for them BEFORE processing. Inline
+            // each list's external blobs first so the SNAPSHOT's key_id (inside the blob,
+            // not the patch metadata) is visible -- else process_patch_lists aborts with
+            // KeyNotFound on the snapshot key. If the share doesn't land in time, skip
+            // this batch instead of aborting; it re-syncs on a later cycle once the key
+            // arrives (process_patch_lists is all-or-nothing on a missing key anyway).
+            let mut missing_all: Vec<Vec<u8>> = Vec::new();
+            for pl in &mut patch_lists {
+                if let Ok(m) = proc.missing_key_ids_after_inline(pl, &download).await {
+                    missing_all.extend(m);
+                }
+            }
+            if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all).await {
+                // The re-shared key didn't land in time. Report failure rather than a
+                // false success: the initial critical-sync path treats Ok as permission
+                // to cancel its retry watchdog and dispatch Connected, which would leave
+                // CriticalBlock/CriticalUnblockLow unsynced with no scheduled retry. The
+                // collections re-sync on the retry (or a later server_sync) once the
+                // share arrives; the keys we DID repair are already persisted.
+                return Err(anyhow::anyhow!(
+                    "app-state decode key(s) still missing after re-request; deferring batched sync"
+                ));
+            }
+
+            // Process the already-parsed (and inlined) collections; keys are present.
             let results = proc
                 .process_patch_lists(patch_lists, &download, true)
                 .await?;
@@ -440,18 +466,19 @@ impl Client {
 
             let _decode_start = wacore::time::Instant::now();
 
-            // Pre-download all external blobs (snapshot and patch mutations)
-            // We use directPath as the key to identify each blob
+            // Parse the response once here; the same parsed list is handed to the
+            // processor below (no second parse).
+            let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
+                name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
+
+            let proc = self.get_app_state_processor().await;
+
+            // Pre-download all external blobs (snapshot and patch mutations); keyed by
+            // directPath.
             let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
-
-            // Parse the response once here for pre-download; the same parsed list
-            // is handed to the processor below (no second parse).
-            let pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
             {
-                debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
-                    name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
-
                 // Download external snapshot if present
                 if let Some(ext) = &pl.snapshot_ref
                     && let Some(path) = &ext.direct_path
@@ -505,7 +532,24 @@ impl Client {
                 }
             };
 
-            let proc = self.get_app_state_processor().await;
+            // Request any missing decode keys and wait for them BEFORE processing. Inline
+            // the blobs first so the SNAPSHOT's key_id (inside its external blob, not the
+            // patch metadata) is visible -- else process aborts with KeyNotFound on the
+            // snapshot key. If the share doesn't land in time, skip this collection
+            // instead of aborting; it re-syncs on a later cycle once the key arrives.
+            let missing = proc
+                .missing_key_ids_after_inline(&mut pl, &download)
+                .await
+                .unwrap_or_default();
+            if !missing.is_empty() && !self.request_keys_and_wait(missing).await {
+                // Report failure (not a partial success) so the caller retries instead of
+                // treating the collection as synced; it re-syncs once the share lands.
+                // Pages already decoded this run have their version persisted.
+                return Err(anyhow::anyhow!(
+                    "app-state decode key(s) for {name:?} still missing after re-request; deferring sync"
+                ));
+            }
+
             let (mutations, new_state, list) =
                 proc.process_parsed_patch_list(pl, &download, true).await?;
             let decode_elapsed = _decode_start.elapsed();
@@ -541,11 +585,46 @@ impl Client {
         Ok(())
     }
 
+    /// Shared missing-key repair step for both sync paths: request the given keys and,
+    /// only if a fresh request actually went out (the per-key dedup didn't suppress it),
+    /// wait briefly for the primary to re-share. Returns true iff the caller should
+    /// refetch (a request was sent and we waited); false means nothing was requested
+    /// (empty or deduped), so the caller proceeds without stalling.
+    /// Request the missing decode keys, wait briefly for the re-share, then VERIFY they
+    /// actually landed. Returns true only when every requested key is now stored (the
+    /// caller may process); false means the share didn't arrive in time and the caller
+    /// must NOT process -- doing so would abort with KeyNotFound -- and should skip the
+    /// collection so it re-syncs on a later cycle. Empty input returns true (nothing to
+    /// wait for). Waits even when the per-key dedup suppressed the send: a deduped
+    /// request means an earlier one is still in flight, so the key may yet land here,
+    /// and a re-verify that fails can't be masked by treating "request sent" as success
+    /// or by a wake from an unrelated key share.
+    async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>) -> bool {
+        if missing.is_empty() {
+            return true;
+        }
+        let count = missing.len();
+        let listener = self.initial_keys_synced_notifier.listen();
+        self.request_missing_keys_with_dedup(missing.clone()).await;
+        debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to 10s for the re-share");
+        let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+        let backend = self.persistence_manager.backend();
+        for id in &missing {
+            if backend.get_sync_key(id).await.ok().flatten().is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Request missing app-state keys with dedup stamps.
     /// On send failure, removes stamps so keys can be retried next sync.
-    async fn request_missing_keys_with_dedup(&self, missing: Vec<Vec<u8>>) {
+    /// Returns true iff a fresh key request was actually sent (some ids passed the
+    /// per-key dedup and the send succeeded), so the caller knows whether a re-share
+    /// is plausibly inbound and worth waiting for.
+    async fn request_missing_keys_with_dedup(&self, missing: Vec<Vec<u8>>) -> bool {
         if missing.is_empty() {
-            return;
+            return false;
         }
         let mut to_request: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
         let mut guard = self.app_state_key_requests.lock().await;
@@ -563,15 +642,18 @@ impl Client {
         }
         guard.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(24 * 3600));
         drop(guard);
-        if !to_request.is_empty()
-            && let Err(e) = self.request_app_state_keys(&to_request).await
-        {
+        if to_request.is_empty() {
+            return false;
+        }
+        if let Err(e) = self.request_app_state_keys(&to_request).await {
             warn!("Failed to send app state key request: {e}");
             let mut guard = self.app_state_key_requests.lock().await;
             for key_id in &to_request {
                 guard.remove(&hex::encode(key_id));
             }
+            return false;
         }
+        true
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
@@ -580,8 +662,13 @@ impl Client {
             return Ok(());
         }
         let device_snapshot = self.persistence_manager.get_device_snapshot();
+        // Address the request to the PRIMARY (device 0), not our own device JID: this is
+        // a peer message and `device_snapshot.pn` carries OUR device number, so sending
+        // it as-is encrypts to ourselves (no self-session exists) and fails with
+        // "session ... not found". The primary is the app-state key source and we hold a
+        // session with it from pairing. Mirrors whatsmeow's `ownID.ToNonAD()`.
         let own_jid = match device_snapshot.pn.clone() {
-            Some(j) => j,
+            Some(j) => j.to_non_ad(),
             None => {
                 return Err(anyhow::anyhow!(
                     "no own JID available for app-state key request"
