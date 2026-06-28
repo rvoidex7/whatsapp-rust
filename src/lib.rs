@@ -51,6 +51,7 @@ pub use client::ClientError;
 pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
 pub use client::{CallError, Voip};
+pub use types::durability_hook::InboundDurabilityHook;
 pub mod download;
 pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;

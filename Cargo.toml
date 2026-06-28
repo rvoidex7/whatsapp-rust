@@ -200,6 +200,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 aes = { workspace = true }
+async-trait = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 # Cross-platform audio I/O for the `voip` example only. A dev-dependency, so it
 # never reaches consumers of the published lib (and only compiles when an example
