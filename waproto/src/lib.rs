@@ -6,6 +6,10 @@
 //! `whatsapp.proto`, run `scripts/regenerate-proto-desc.sh` (wraps `protoc`).
 
 #![allow(clippy::large_enum_variant)]
+/// Re-exported because its types permeate the generated API; depending on it
+/// directly would require version-matching this crate exactly.
+pub use buffa;
+
 pub mod whatsapp {
     #![allow(
         non_camel_case_types,

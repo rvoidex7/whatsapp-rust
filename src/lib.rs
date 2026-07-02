@@ -25,6 +25,19 @@ pub use wacore;
 pub use wacore_binary;
 pub use waproto;
 
+// Third-party re-exports: these crates' types appear in the public API, so
+// consumers must name them; a direct dependency would have to version-match
+// this crate exactly.
+pub use anyhow;
+pub use async_channel;
+pub use async_trait::async_trait;
+pub use bytes;
+pub use futures;
+pub use serde;
+pub use serde_json;
+pub use wacore::chrono;
+pub use waproto::buffa;
+
 pub mod cache;
 pub mod portable_cache;
 pub(crate) mod resend_rate_limiter;
@@ -136,6 +149,8 @@ pub mod prelude {
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+    /// Optional sub-message wrapper in `wa::Message` literals.
+    pub use waproto::buffa::MessageField;
     /// The protobuf namespace (`wa::Message`, `wa::message::*`).
     pub use waproto::whatsapp as wa;
 }
@@ -144,3 +159,6 @@ pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
 
 #[cfg(test)]
 pub mod test_utils;
+
+#[cfg(test)]
+mod reexports_test;
