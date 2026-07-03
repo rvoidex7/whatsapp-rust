@@ -127,18 +127,22 @@ impl LidPnCache {
         wacore::stats::CollectionStats,
     ) {
         use wacore::stats::HeapSize;
-        let mut lid_ptrs = std::collections::HashSet::new();
+        // Dedup by heap address as `usize`, not `*const LidPnEntry`: a raw-pointer
+        // set is `!Send`, and held across the two `.await`s below it would make
+        // `Client::memory_report()` `!Send` (unusable off a single thread). The cast
+        // is a plain address on every target (`LidPnEntry: Sized` → thin pointer).
+        let mut lid_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let lid = self
             .lid_to_entry
             .memory_stats(|_, v| {
-                lid_ptrs.insert(Arc::as_ptr(v));
+                lid_ptrs.insert(Arc::as_ptr(v) as usize);
                 v.heap_bytes()
             })
             .await;
         let pn = self
             .pn_to_entry
             .memory_stats(|_, v| {
-                if lid_ptrs.contains(&Arc::as_ptr(v)) {
+                if lid_ptrs.contains(&(Arc::as_ptr(v) as usize)) {
                     0
                 } else {
                     v.heap_bytes()

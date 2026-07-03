@@ -442,3 +442,15 @@ impl Client {
         router
     }
 }
+
+#[cfg(test)]
+mod send_checks {
+    /// Compile-time guard that `memory_report()` stays `Send`: a `!Send` value held
+    /// across an `.await` (e.g. a raw-pointer dedup set) would silently break
+    /// `tokio::spawn` / axum callers. Built for its type only, never polled.
+    #[allow(dead_code)]
+    fn memory_report_future_is_send(c: &super::Client) {
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&c.memory_report());
+    }
+}
