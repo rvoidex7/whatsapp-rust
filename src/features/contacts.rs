@@ -230,7 +230,31 @@ impl<'a> Contacts<'a> {
         debug!("get_user_info: fetching info for {} JIDs", jids.len());
 
         let request_id = self.client.generate_request_id();
-        let spec = UserInfoSpec::new(jids.to_vec(), request_id);
+        let mut spec = UserInfoSpec::new(jids.to_vec(), request_id);
+
+        // Attach per-user tctokens so the status/about of privacy-restricted
+        // contacts is returned, matching WA Web's USyncStatusProtocol.getUserElement.
+        if self
+            .client
+            .ab_props()
+            .is_enabled(wacore::iq::abprops::web::PROFILE_SCRAPING_PRIVACY_TOKEN_IN_ABOUT_USYNC)
+            .await
+        {
+            let lookups = futures::future::join_all(jids.iter().map(|jid| async move {
+                (
+                    jid.to_non_ad().to_string(),
+                    self.client.lookup_tc_token_for_jid(jid).await,
+                )
+            }))
+            .await;
+            let tc_tokens: HashMap<String, Vec<u8>> = lookups
+                .into_iter()
+                .filter_map(|(key, token)| token.map(|t| (key, t)))
+                .collect();
+            if !tc_tokens.is_empty() {
+                spec = spec.with_tc_tokens(tc_tokens);
+            }
+        }
 
         let info = self.client.execute(spec).await?;
         self.persist_lid_mappings(info.values().map(user_info_lid_pair))
