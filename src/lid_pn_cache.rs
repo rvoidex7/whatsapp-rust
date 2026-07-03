@@ -111,13 +111,41 @@ impl LidPnCache {
         let _ = self.topology.set(topology);
     }
 
-    /// Returns approximate entry counts for the LID and PN maps.
-    #[cfg(feature = "debug-diagnostics")]
-    pub fn entry_counts(&self) -> (u64, u64) {
-        (
-            self.lid_to_entry.entry_count(),
-            self.pn_to_entry.entry_count(),
-        )
+    /// Approximate entry counts plus estimated retained bytes for the LID and
+    /// PN maps. Bytes are `0` when backed by a custom store (entries live
+    /// outside this process).
+    ///
+    /// `add()` stores the same `Arc<LidPnEntry>` under both directions, so the
+    /// payload is attributed to the LID map; the PN side counts only entries
+    /// the LID map no longer holds (transient eviction asymmetry), keeping
+    /// every entry counted exactly once. `Arc<T>`'s `HeapSize` already
+    /// includes `size_of::<LidPnEntry>()`.
+    pub async fn memory_stats(
+        &self,
+    ) -> (
+        wacore::stats::CollectionStats,
+        wacore::stats::CollectionStats,
+    ) {
+        use wacore::stats::HeapSize;
+        let mut lid_ptrs = std::collections::HashSet::new();
+        let lid = self
+            .lid_to_entry
+            .memory_stats(|_, v| {
+                lid_ptrs.insert(Arc::as_ptr(v));
+                v.heap_bytes()
+            })
+            .await;
+        let pn = self
+            .pn_to_entry
+            .memory_stats(|_, v| {
+                if lid_ptrs.contains(&Arc::as_ptr(v)) {
+                    0
+                } else {
+                    v.heap_bytes()
+                }
+            })
+            .await;
+        (lid, pn)
     }
 
     /// Get the current LID for a phone number.

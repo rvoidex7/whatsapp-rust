@@ -129,8 +129,7 @@ impl Client {
             ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
-            last_data_received_ms: Arc::new(AtomicU64::new(0)),
-            last_data_sent_ms: Arc::new(AtomicU64::new(0)),
+            stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),
             transport_events: Arc::new(Mutex::new(None)),
@@ -310,7 +309,16 @@ impl Client {
             warn!("Client `run` method called while already running.");
             return;
         }
+        // Reconnects are counted at iteration start: every pass after the
+        // first is an attempt actually being made. Counting at the branches
+        // below would also count a final pass that never reconnects (a user
+        // disconnect() flips is_running while the branch runs).
+        let mut first_connect = true;
         while self.is_running.load(Ordering::Relaxed) {
+            if !first_connect {
+                self.stats.record_reconnect();
+            }
+            first_connect = false;
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
@@ -493,6 +501,7 @@ impl Client {
             &self.ik_handshake_failures,
             transport.clone(),
             &mut transport_events,
+            Some(self.stats.clone()),
         )
         .await
         {
@@ -745,8 +754,7 @@ impl Client {
         self.swap_message_semaphore(1);
         // Reset dead-socket timestamps so stale values from the previous
         // connection don't trigger an immediate reconnect on the next one.
-        self.last_data_received_ms.store(0, Ordering::Relaxed);
-        self.last_data_sent_ms.store(0, Ordering::Relaxed);
+        self.stats.reset_connection_activity();
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);

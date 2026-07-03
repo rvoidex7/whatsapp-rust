@@ -119,10 +119,8 @@ impl Client {
                         match event_result {
                             Ok(crate::transport::TransportEvent::DataReceived(data)) => {
                                 // Update dead-socket timer (WA Web: deadSocketTimer reset)
-                                self.last_data_received_ms.store(
-                                    wacore::time::now_millis().max(0) as u64,
-                                    Ordering::Relaxed,
-                                );
+                                self.stats.mark_recv_activity();
+                                let wire_bytes = data.len();
 
                                 // Feed data into the frame decoder. The payload is
                                 // adopted zero-copy when it is the sole reference
@@ -162,6 +160,10 @@ impl Client {
                                     // Check if we should exit after processing (e.g., after 515 stream error)
                                     if self.expected_disconnect.load(Ordering::Relaxed) {
                                         debug!("Expected disconnect signaled during frame processing. Exiting message loop.");
+                                        // The batch (this frame included — its counter
+                                        // increment is below) must not vanish from the
+                                        // wire counters on this exit path.
+                                        self.stats.record_recv_batch(wire_bytes, frames_in_batch + 1);
                                         return Ok(ReadLoopExit::Expected);
                                     }
 
@@ -174,16 +176,12 @@ impl Client {
                                     }
                                 }
 
-                                // Refresh timestamp after processing the entire batch so
-                                // the keepalive loop sees the batch completion time, not
-                                // just the arrival time. Prevents stale reads when a
-                                // large batch (e.g. offline sync) takes seconds to drain.
-                                if frames_in_batch > 1 {
-                                    self.last_data_received_ms.store(
-                                        wacore::time::now_millis().max(0) as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
+                                // Count the batch and refresh the timestamp after
+                                // processing so the keepalive loop sees the batch
+                                // completion time, not just the arrival time. Prevents
+                                // stale reads when a large batch (e.g. offline sync)
+                                // takes seconds to drain.
+                                self.stats.record_recv_batch(wire_bytes, frames_in_batch);
                             },
                             Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {

@@ -153,9 +153,13 @@ impl DeviceRegistryCache {
         self.cache.insert(key, record).await;
     }
 
-    #[cfg(feature = "debug-diagnostics")]
-    pub(crate) fn entry_count(&self) -> u64 {
-        self.cache.entry_count()
+    /// Approximate entry count plus estimated retained bytes. Bytes are `0`
+    /// when backed by a custom store (entries live outside this process).
+    pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
+        use wacore::stats::HeapSize;
+        self.cache
+            .memory_stats(|k, v| k.capacity() + v.heap_bytes())
+            .await
     }
 
     /// Test-only passthrough for cache maintenance flushes.

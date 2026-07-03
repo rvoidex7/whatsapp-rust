@@ -83,41 +83,77 @@ impl Client {
         self.resend_rate_limiter.set_rate(burst, refill_per_min);
     }
 
-    /// Total outbound resends dropped by the per-chat rate limiter since start.
-    /// Surfaces storm chats without the `debug-diagnostics` feature.
-    pub fn resends_throttled_total(&self) -> u64 {
-        self.resend_rate_limiter.throttled_total()
+    /// Cumulative wire I/O and activity counters for this client session.
+    ///
+    /// Always available, no feature gate: recording costs one relaxed atomic
+    /// add per wire frame. Byte counts are post-noise wire bytes (frame
+    /// headers and AEAD tags included; handshake and TLS/WebSocket overhead
+    /// excluded), so two clients in one process can be compared directly.
+    pub fn stats(&self) -> StatsSnapshot {
+        let mut snapshot = self.stats.snapshot();
+        snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
+        snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
+        snapshot
     }
 
-    /// Returns a snapshot of all internal collection sizes for memory leak detection.
+    /// Entry counts plus estimated retained heap bytes for the client's
+    /// internal collections. See [`MemoryReport`] for the semantics of the
+    /// byte figures.
     ///
-    /// Moka caches report approximate counts (pending evictions may not be reflected).
-    /// Call `run_pending_tasks()` on individual caches first if you need exact counts.
-    ///
-    /// Requires the `debug-diagnostics` feature.
-    #[cfg(feature = "debug-diagnostics")]
-    pub async fn memory_diagnostics(&self) -> MemoryDiagnostics {
-        let (sig_sessions, sig_identities, sig_sender_keys) =
-            self.signal_cache.entry_counts().await;
-        let (lid_lid, lid_pn) = self.lid_pn_cache.entry_counts();
+    /// On-demand only: walks the in-process caches under their locks when
+    /// called, costs nothing otherwise. Counts are approximate (caches may
+    /// have pending evictions); call `run_pending_tasks()` on individual
+    /// caches first if you need exact counts.
+    pub async fn memory_report(&self) -> MemoryReport {
+        use wacore::stats::{CollectionStats, HeapSize};
+
+        let (signal_sessions, signal_identities, signal_sender_keys) =
+            self.signal_cache.memory_stats().await;
+        let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats().await;
         let pending_retries_count = self
             .pending_retries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
 
-        MemoryDiagnostics {
-            group_cache: self
-                .group_cache
-                .lock()
-                .await
-                .as_ref()
-                .map_or(0, |c| c.entry_count()),
-            device_registry_cache: self.device_registry_cache.entry_count(),
-            lid_pn_lid_entries: lid_lid,
-            lid_pn_pn_entries: lid_pn,
-            recent_messages: self.recent_messages.entry_count(),
-            sender_key_device_cache: self.sender_key_device_cache.entry_count(),
+        // Only the Arc is taken under the mutex — the walk must not block
+        // get_group_cache(), which every group send goes through.
+        let group_cache_arc = self.group_cache.lock().await.clone();
+        let group_cache = match group_cache_arc {
+            // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
+            Some(cache) => {
+                cache
+                    .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+                    .await
+            }
+            None => CollectionStats::default(),
+        };
+
+        let recent_messages = self
+            .recent_messages
+            .memory_stats(|k, v| k.chat.heap_bytes() + k.id.heap_bytes() + v.heap_bytes())
+            .await;
+
+        let group_devices_memo = self
+            .group_devices_memo
+            .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+            .await;
+
+        // Each count read into a local so no two guards are ever held at once.
+        let response_waiters = self.response_waiters.lock().await.len();
+        let presence_subscriptions = self.presence_subscriptions.lock().await.len();
+        let app_state_key_requests = self.app_state_key_requests.lock().await.len();
+        let app_state_syncing = self.app_state_syncing.lock().await.len();
+        let chatstate_handlers = self.chatstate_handlers.read().await.len();
+
+        MemoryReport {
+            group_cache,
+            device_registry_cache: self.device_registry_cache.memory_stats().await,
+            lid_pn_lid_entries,
+            lid_pn_pn_entries,
+            recent_messages,
+            sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
+            group_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
@@ -125,17 +161,16 @@ impl Client {
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
-            resends_throttled_total: self.resend_rate_limiter.throttled_total(),
-            response_waiters: self.response_waiters.lock().await.len(),
+            response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
-            presence_subscriptions: self.presence_subscriptions.lock().await.len(),
-            app_state_key_requests: self.app_state_key_requests.lock().await.len(),
-            app_state_syncing: self.app_state_syncing.lock().await.len(),
-            signal_cache_sessions: sig_sessions,
-            signal_cache_identities: sig_identities,
-            signal_cache_sender_keys: sig_sender_keys,
-            chatstate_handlers: self.chatstate_handlers.read().await.len(),
+            presence_subscriptions,
+            app_state_key_requests,
+            app_state_syncing,
+            signal_sessions,
+            signal_identities,
+            signal_sender_keys,
+            chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }
     }

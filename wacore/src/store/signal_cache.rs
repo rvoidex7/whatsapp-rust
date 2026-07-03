@@ -754,13 +754,79 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    /// Returns the number of entries in each store (sessions, identities, sender_keys).
-    #[cfg(feature = "debug-diagnostics")]
-    pub async fn entry_counts(&self) -> (usize, usize, usize) {
-        let s = self.sessions.lock().await;
-        let i = self.identities.lock().await;
-        let sk = self.sender_keys.lock().await;
-        (s.cache.len(), i.cache.len(), sk.cache.len())
+    /// Entry counts and estimated retained bytes for each store
+    /// (sessions, identities, sender_keys). Sizes use the records' encoded-size
+    /// proxy (see `SessionRecord::estimated_size`); on-demand only — walks the
+    /// caches under their locks.
+    ///
+    /// Session entry counts include negative (`Absent`) and checked-out slots
+    /// — they occupy the map. Byte totals include the key length for every
+    /// slot, but the estimated record payload only for `Present` entries.
+    pub async fn memory_stats(
+        &self,
+    ) -> (
+        crate::stats::CollectionStats,
+        crate::stats::CollectionStats,
+        crate::stats::CollectionStats,
+    ) {
+        use crate::stats::CollectionStats;
+
+        // Sizing a record walks its whole protobuf tree, and these mutexes
+        // serialize the Signal encrypt/decrypt path — so only key lengths and
+        // Arc refcount bumps happen under the locks; the estimated_size walks
+        // run after each guard drops. Identities are raw bytes (len is free)
+        // and stay fully under their lock.
+        let (session_count, session_keys_len, session_recs): (u64, usize, Vec<_>) = {
+            let s = self.sessions.lock().await;
+            let mut keys_len = 0usize;
+            let recs = s
+                .cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    keys_len += k.len();
+                    match v {
+                        SessionEntry::Present(rec) => Some(rec.clone()),
+                        SessionEntry::Absent | SessionEntry::CheckedOut => None,
+                    }
+                })
+                .collect();
+            (s.cache.len() as u64, keys_len, recs)
+        };
+        let session_bytes: usize = session_keys_len
+            + session_recs
+                .iter()
+                .map(|r| r.estimated_size())
+                .sum::<usize>();
+        let sessions = CollectionStats::new(session_count, session_bytes as u64);
+
+        let identities = {
+            let i = self.identities.lock().await;
+            let bytes: usize = i
+                .cache
+                .iter()
+                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
+                .sum();
+            CollectionStats::new(i.cache.len() as u64, bytes as u64)
+        };
+
+        let (sk_count, sk_keys_len, sk_recs): (u64, usize, Vec<_>) = {
+            let sk = self.sender_keys.lock().await;
+            let mut keys_len = 0usize;
+            let recs = sk
+                .cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    keys_len += k.len();
+                    v.clone()
+                })
+                .collect();
+            (sk.cache.len() as u64, keys_len, recs)
+        };
+        let sk_bytes: usize =
+            sk_keys_len + sk_recs.iter().map(|r| r.estimated_size()).sum::<usize>();
+        let sender_keys = CollectionStats::new(sk_count, sk_bytes as u64);
+
+        (sessions, identities, sender_keys)
     }
 
     /// Clear all cached state (used on disconnect/reconnect).
